@@ -6,4 +6,4 @@ services:
       - "1080:1080"
     volumes:
       - ./config.yaml:/app/config.yaml:ro
-      - ./ip.txt:/app/ip.txt:ro
+      - ./cidr.txt:/app/cidr.txt:ro

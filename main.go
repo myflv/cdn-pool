@@ -12,9 +12,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/miekg/dns"
 	"gopkg.in/yaml.v3"
 )
 
@@ -28,21 +30,27 @@ func main() {
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
-	ips, err := loadIPs(resolvePath(*cfgPath, cfg.IPFile))
+	cidrs, err := loadCIDRs(resolvePath(*cfgPath, cfg.CIDRFile))
 	if err != nil {
-		log.Fatalf("load ip file: %v", err)
+		log.Fatalf("load cidr file: %v", err)
 	}
-	if len(ips) == 0 {
-		log.Fatal("ip.txt is empty")
+	if len(cidrs) == 0 {
+		log.Fatal("cidr.txt is empty")
 	}
 
+	log.Printf("cdn-pool %s socks5=%s hosts=%d cidrs=%d cname=%s via %s",
+		version, cfg.Listen, len(cfg.Hosts), len(cidrs), cfg.CNAME, cfg.DNS)
+	ips, err := discoverIPs(cfg.DNS, cfg.CNAME, cidrs)
+	if err != nil {
+		log.Fatalf("first refresh: %v", err)
+	}
 	s := &server{
 		pool:   newPool(ips, cfg.MaxFails, cfg.Cooldown),
 		hosts:  newHostSet(cfg.Hosts),
 		dialer: &net.Dialer{Timeout: cfg.DialTimeout, KeepAlive: 30 * time.Second},
 	}
-	log.Printf("cdn-pool %s socks5=%s hosts=%d ips=%d",
-		version, cfg.Listen, len(cfg.Hosts), len(ips))
+	log.Printf("refresh: %d ips from %d cidrs", len(ips), len(cidrs))
+	go refreshLoop(cfg, cidrs, s.pool)
 
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
@@ -60,8 +68,11 @@ func main() {
 
 type config struct {
 	Listen      string        `yaml:"listen"`
-	IPFile      string        `yaml:"ip-file"`
+	CIDRFile    string        `yaml:"cidr-file"`
 	Hosts       []string      `yaml:"hosts"`
+	CNAME       string        `yaml:"cname"`
+	DNS         string        `yaml:"dns"`
+	Refresh     time.Duration `yaml:"refresh"`
 	MaxFails    int           `yaml:"max-fails"`
 	Cooldown    time.Duration `yaml:"cooldown"`
 	DialTimeout time.Duration `yaml:"dial-timeout"`
@@ -79,8 +90,8 @@ func loadConfig(path string) (*config, error) {
 	if cfg.Listen == "" {
 		cfg.Listen = "0.0.0.0:1080"
 	}
-	if cfg.IPFile == "" {
-		cfg.IPFile = "ip.txt"
+	if cfg.CIDRFile == "" {
+		cfg.CIDRFile = "cidr.txt"
 	}
 	if cfg.MaxFails <= 0 {
 		cfg.MaxFails = 3
@@ -91,20 +102,31 @@ func loadConfig(path string) (*config, error) {
 	if cfg.DialTimeout <= 0 {
 		cfg.DialTimeout = 8 * time.Second
 	}
+	if cfg.Refresh <= 0 {
+		cfg.Refresh = 10 * time.Minute
+	}
+	if cfg.DNS == "" {
+		cfg.DNS = "223.5.5.5:53"
+	} else if _, _, err := net.SplitHostPort(cfg.DNS); err != nil {
+		cfg.DNS = net.JoinHostPort(cfg.DNS, "53")
+	}
 	if len(cfg.Hosts) == 0 {
 		return nil, errors.New("hosts is required (domains that use the IP pool)")
+	}
+	if cfg.CNAME == "" {
+		return nil, errors.New("cname is required")
 	}
 	return cfg, nil
 }
 
-func resolvePath(cfgPath, ipFile string) string {
-	if filepath.IsAbs(ipFile) {
-		return ipFile
+func resolvePath(cfgPath, file string) string {
+	if filepath.IsAbs(file) {
+		return file
 	}
-	return filepath.Join(filepath.Dir(cfgPath), ipFile)
+	return filepath.Join(filepath.Dir(cfgPath), file)
 }
 
-func loadIPs(path string) ([]string, error) {
+func loadCIDRs(path string) ([]string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -112,27 +134,35 @@ func loadIPs(path string) ([]string, error) {
 	defer f.Close()
 
 	seen := map[string]struct{}{}
-	var ips []string
+	var cidrs []string
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		if host, _, err := net.SplitHostPort(line); err == nil {
-			line = host
+		if !strings.Contains(line, "/") {
+			line += "/24"
 		}
-		if net.ParseIP(line) == nil {
-			log.Printf("skip invalid ip: %s", line)
+		ip, _, err := net.ParseCIDR(line)
+		if err != nil {
+			log.Printf("skip invalid cidr: %s", line)
 			continue
 		}
-		if _, ok := seen[line]; ok {
+		n := ip.To4()
+		if n == nil {
+			log.Printf("skip invalid cidr: %s", line)
 			continue
 		}
-		seen[line] = struct{}{}
-		ips = append(ips, line)
+		n[3] = 0
+		key := n.String()
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		cidrs = append(cidrs, key)
 	}
-	return ips, sc.Err()
+	return cidrs, sc.Err()
 }
 
 type suffixRule struct {
@@ -187,6 +217,7 @@ type node struct {
 }
 
 type pool struct {
+	mu       sync.RWMutex
 	nodes    []*node
 	idx      atomic.Uint64
 	maxFails int32
@@ -194,28 +225,29 @@ type pool struct {
 }
 
 func newPool(ips []string, maxFails int, cool time.Duration) *pool {
-	p := &pool{maxFails: int32(maxFails), cool: cool, nodes: make([]*node, 0, len(ips))}
-	for _, ip := range ips {
-		p.nodes = append(p.nodes, &node{ip: ip})
-	}
+	p := &pool{maxFails: int32(maxFails), cool: cool}
+	p.replace(ips)
 	return p
 }
 
 func (p *pool) next() *node {
-	n := len(p.nodes)
+	p.mu.RLock()
+	nodes := p.nodes
+	p.mu.RUnlock()
+	n := len(nodes)
 	if n == 0 {
 		return nil
 	}
 	now := time.Now().UnixNano()
 	start := int(p.idx.Add(1) - 1)
 	for i := 0; i < n; i++ {
-		nd := p.nodes[(start+i)%n]
+		nd := nodes[(start+i)%n]
 		if nd.cooldown.Load() > now {
 			continue
 		}
 		return nd
 	}
-	return p.nodes[start%n]
+	return nodes[start%n]
 }
 
 func (p *pool) ok(nd *node) {
@@ -229,6 +261,17 @@ func (p *pool) fail(nd *node) {
 		nd.fails.Store(0)
 		log.Printf("cooldown %s for %s", nd.ip, p.cool)
 	}
+}
+
+func (p *pool) replace(ips []string) {
+	nodes := make([]*node, len(ips))
+	for i, ip := range ips {
+		nodes[i] = &node{ip: ip}
+	}
+	p.mu.Lock()
+	p.nodes = nodes
+	p.idx.Store(0)
+	p.mu.Unlock()
 }
 
 type server struct {
@@ -381,4 +424,98 @@ func pipe(a, b net.Conn) {
 		a.Close()
 	}()
 	_, _ = io.Copy(b, a)
+}
+
+func refreshLoop(cfg *config, cidrs []string, p *pool) {
+	t := time.NewTicker(cfg.Refresh)
+	defer t.Stop()
+	for range t.C {
+		if err := refreshOnce(cfg, cidrs, p); err != nil {
+			log.Printf("refresh: %v", err)
+		}
+	}
+}
+
+func refreshOnce(cfg *config, cidrs []string, p *pool) error {
+	ips, err := discoverIPs(cfg.DNS, cfg.CNAME, cidrs)
+	if err != nil {
+		return err
+	}
+	p.replace(ips)
+	log.Printf("refresh: %d ips from %d cidrs", len(ips), len(cidrs))
+	return nil
+}
+
+func discoverIPs(server, name string, cidrs []string) ([]string, error) {
+	cli := &dns.Client{Timeout: 5 * time.Second, UDPSize: 1232}
+	sem := make(chan struct{}, 16)
+	var (
+		wg   sync.WaitGroup
+		mu   sync.Mutex
+		seen = map[string]struct{}{}
+		out  []string
+	)
+	for _, subnet := range cidrs {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(subnet string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			ips, err := lookupAWithECS(cli, server, name, subnet)
+			if err != nil {
+				log.Printf("refresh %s: %v", subnet, err)
+				return
+			}
+			mu.Lock()
+			for _, ip := range ips {
+				if _, dup := seen[ip]; dup {
+					continue
+				}
+				seen[ip] = struct{}{}
+				out = append(out, ip)
+			}
+			mu.Unlock()
+		}(subnet)
+	}
+	wg.Wait()
+	if len(out) == 0 {
+		return nil, errors.New("all ecs queries failed")
+	}
+	return out, nil
+}
+
+func lookupAWithECS(c *dns.Client, server, name, ecsIP string) ([]string, error) {
+	ip := net.ParseIP(ecsIP).To4()
+	if ip == nil {
+		return nil, errors.New("bad ecs ip")
+	}
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(name), dns.TypeA)
+	m.SetEdns0(1232, false)
+	m.IsEdns0().Option = append(m.IsEdns0().Option, &dns.EDNS0_SUBNET{
+		Code:          dns.EDNS0SUBNET,
+		Family:        1,
+		SourceNetmask: 24,
+		Address:       ip,
+	})
+
+	r, _, err := c.Exchange(m, server)
+	if err != nil {
+		return nil, err
+	}
+	if r.Truncated {
+		tcp := *c
+		tcp.Net = "tcp"
+		r, _, err = tcp.Exchange(m, server)
+		if err != nil {
+			return nil, err
+		}
+	}
+	var ips []string
+	for _, rr := range r.Answer {
+		if a, ok := rr.(*dns.A); ok {
+			ips = append(ips, a.A.String())
+		}
+	}
+	return ips, nil
 }

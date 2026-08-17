@@ -1,9 +1,12 @@
 listen: "0.0.0.0:1080"
-ip-file: "ip.txt"
-# 只有这些域名走 ip.txt 轮询；其它域名正常 DNS。
+cidr-file: "cidr.txt"
+# 只有这些域名走池子轮询；其它域名正常 DNS。
 # 支持精确匹配和 *.example.com
 hosts:
   - cdn.example.com
+cname: "cdn.example.com"
+dns: "223.5.5.5:53"
+refresh: 10m
 max-fails: 3
 cooldown: 30s
 dial-timeout: 8s
