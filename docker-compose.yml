@@ -1,5 +1,5 @@
 services:
-  cdn-pool:
+  daemon:
     image: ghcr.io/myflv/cdn-pool:latest
     restart: unless-stopped
     ports:
