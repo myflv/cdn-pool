@@ -12,5 +12,5 @@ WORKDIR /app
 COPY --from=build /cdn-pool /usr/local/bin/cdn-pool
 COPY config.yaml /app/config.yaml
 COPY ip.txt /app/ip.txt
-EXPOSE 18080
+EXPOSE 1080
 ENTRYPOINT ["cdn-pool", "-c", "/app/config.yaml"]

@@ -2,19 +2,16 @@ package main
 
 import (
 	"bufio"
-	"context"
-	"crypto/tls"
-	"encoding/json"
+	"encoding/binary"
 	"errors"
 	"flag"
 	"io"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -31,7 +28,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
-
 	ips, err := loadIPs(resolvePath(*cfgPath, cfg.IPFile))
 	if err != nil {
 		log.Fatalf("load ip file: %v", err)
@@ -40,26 +36,35 @@ func main() {
 		log.Fatal("ip.txt is empty")
 	}
 
-	p := newProxy(cfg, newPool(ips, cfg.MaxFails, cfg.Cooldown))
-	log.Printf("cdn-pool %s listen=%s host=%s ips=%d", version, cfg.Listen, cfg.CDNHost, len(ips))
-
-	srv := &http.Server{
-		Addr:              cfg.Listen,
-		Handler:           p,
-		ReadHeaderTimeout: 15 * time.Second,
-		IdleTimeout:       90 * time.Second,
+	s := &server{
+		pool:   newPool(ips, cfg.MaxFails, cfg.Cooldown),
+		hosts:  newHostSet(cfg.Hosts),
+		dialer: &net.Dialer{Timeout: cfg.DialTimeout, KeepAlive: 30 * time.Second},
 	}
-	log.Fatal(srv.ListenAndServe())
+	log.Printf("cdn-pool %s socks5=%s hosts=%d ips=%d",
+		version, cfg.Listen, len(cfg.Hosts), len(ips))
+
+	ln, err := net.Listen("tcp", cfg.Listen)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			log.Printf("accept: %v", err)
+			continue
+		}
+		go s.serve(c)
+	}
 }
 
 type config struct {
-	Listen      string            `yaml:"listen"`
-	CDNHost     string            `yaml:"cdn-host"`
-	IPFile      string            `yaml:"ip-file"`
-	MaxFails    int               `yaml:"max-fails"`
-	Cooldown    time.Duration     `yaml:"cooldown"`
-	DialTimeout time.Duration     `yaml:"dial-timeout"`
-	Headers     map[string]string `yaml:"headers"`
+	Listen      string        `yaml:"listen"`
+	IPFile      string        `yaml:"ip-file"`
+	Hosts       []string      `yaml:"hosts"`
+	MaxFails    int           `yaml:"max-fails"`
+	Cooldown    time.Duration `yaml:"cooldown"`
+	DialTimeout time.Duration `yaml:"dial-timeout"`
 }
 
 func loadConfig(path string) (*config, error) {
@@ -72,7 +77,7 @@ func loadConfig(path string) (*config, error) {
 		return nil, err
 	}
 	if cfg.Listen == "" {
-		cfg.Listen = "127.0.0.1:18080"
+		cfg.Listen = "0.0.0.0:1080"
 	}
 	if cfg.IPFile == "" {
 		cfg.IPFile = "ip.txt"
@@ -86,11 +91,8 @@ func loadConfig(path string) (*config, error) {
 	if cfg.DialTimeout <= 0 {
 		cfg.DialTimeout = 8 * time.Second
 	}
-	if cfg.Headers == nil {
-		cfg.Headers = map[string]string{}
-	}
-	if cfg.CDNHost == "" {
-		return nil, errors.New("cdn-host is required")
+	if len(cfg.Hosts) == 0 {
+		return nil, errors.New("hosts is required (domains that use the IP pool)")
 	}
 	return cfg, nil
 }
@@ -117,13 +119,11 @@ func loadIPs(path string) ([]string, error) {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		host, port, err := net.SplitHostPort(line)
-		if err != nil {
-			host, port = line, "443"
-			line = net.JoinHostPort(host, port)
+		if host, _, err := net.SplitHostPort(line); err == nil {
+			line = host
 		}
-		if net.ParseIP(host) == nil {
-			log.Printf("skip invalid ip: %s", host)
+		if net.ParseIP(line) == nil {
+			log.Printf("skip invalid ip: %s", line)
 			continue
 		}
 		if _, ok := seen[line]; ok {
@@ -135,11 +135,55 @@ func loadIPs(path string) ([]string, error) {
 	return ips, sc.Err()
 }
 
+type suffixRule struct {
+	dot  string // ".example.com"
+	apex string // "example.com"
+}
+
+type hostSet struct {
+	exact   map[string]struct{}
+	suffix  []suffixRule
+	matchIP bool
+}
+
+func newHostSet(hosts []string) *hostSet {
+	h := &hostSet{exact: map[string]struct{}{}}
+	for _, raw := range hosts {
+		n := strings.ToLower(strings.TrimSpace(raw))
+		n = strings.TrimSuffix(n, ".")
+		if n == "" {
+			continue
+		}
+		if n == "*" {
+			h.matchIP = true
+			continue
+		}
+		if strings.HasPrefix(n, "*.") {
+			dot := n[1:]
+			h.suffix = append(h.suffix, suffixRule{dot: dot, apex: strings.TrimPrefix(dot, ".")})
+			continue
+		}
+		h.exact[n] = struct{}{}
+	}
+	return h
+}
+
+func (h *hostSet) match(name string) bool {
+	if _, ok := h.exact[name]; ok {
+		return true
+	}
+	for _, suf := range h.suffix {
+		if name == suf.apex || strings.HasSuffix(name, suf.dot) {
+			return true
+		}
+	}
+	return false
+}
+
 type node struct {
-	addr     string
+	ip       string
 	fails    atomic.Int32
 	cooldown atomic.Int64
-	tr       *http.Transport
 }
 
 type pool struct {
@@ -149,10 +193,10 @@ type pool struct {
 	cool     time.Duration
 }
 
-func newPool(addrs []string, maxFails int, cool time.Duration) *pool {
-	p := &pool{maxFails: int32(maxFails), cool: cool, nodes: make([]*node, 0, len(addrs))}
-	for _, a := range addrs {
-		p.nodes = append(p.nodes, &node{addr: a})
+func newPool(ips []string, maxFails int, cool time.Duration) *pool {
+	p := &pool{maxFails: int32(maxFails), cool: cool, nodes: make([]*node, 0, len(ips))}
+	for _, ip := range ips {
+		p.nodes = append(p.nodes, &node{ip: ip})
 	}
 	return p
 }
@@ -183,238 +227,158 @@ func (p *pool) fail(nd *node) {
 	if nd.fails.Add(1) >= p.maxFails {
 		nd.cooldown.Store(time.Now().Add(p.cool).UnixNano())
 		nd.fails.Store(0)
-		log.Printf("cooldown %s for %s", nd.addr, p.cool)
+		log.Printf("cooldown %s for %s", nd.ip, p.cool)
 	}
 }
 
-type nodeStat struct {
-	Addr     string `json:"addr"`
-	Fails    int32  `json:"fails"`
-	Cooldown string `json:"cooldown"`
-}
-
-type statsResp struct {
-	CDNHost string     `json:"cdnHost"`
-	Listen  string     `json:"listen"`
-	Total   int        `json:"total"`
-	Nodes   []nodeStat `json:"nodes"`
-}
-
-func (p *pool) stats() []nodeStat {
-	now := time.Now().UnixNano()
-	out := make([]nodeStat, len(p.nodes))
-	for i, nd := range p.nodes {
-		until := nd.cooldown.Load()
-		left := time.Duration(0)
-		if until > now {
-			left = time.Duration(until - now)
-		}
-		out[i] = nodeStat{
-			Addr:     nd.addr,
-			Fails:    nd.fails.Load(),
-			Cooldown: left.Round(time.Millisecond).String(),
-		}
-	}
-	return out
-}
-
-type proxy struct {
-	cfg    *config
+type server struct {
 	pool   *pool
+	hosts  *hostSet
 	dialer *net.Dialer
 }
 
-func newProxy(cfg *config, pool *pool) *proxy {
-	dialer := &net.Dialer{
-		Timeout:   cfg.DialTimeout,
-		KeepAlive: 30 * time.Second,
+func (s *server) serve(c net.Conn) {
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(15 * time.Second))
+
+	host, port, err := socks5Handshake(c)
+	if err != nil {
+		return
 	}
-	tlsCfg := &tls.Config{
-		ServerName: cfg.CDNHost,
-		MinVersion: tls.VersionTLS12,
-		NextProtos: []string{"h2", "http/1.1"},
+
+	up, err := s.dial(host, port)
+	if err != nil {
+		_ = socks5Reply(c, socks5RepHostUnreachable)
+		return
 	}
-	for _, nd := range pool.nodes {
-		addr := nd.addr
-		nd.tr = &http.Transport{
-			TLSClientConfig:     tlsCfg,
-			ForceAttemptHTTP2:   true,
-			DisableCompression:  true,
-			IdleConnTimeout:     90 * time.Second,
-			MaxIdleConns:        8,
-			MaxIdleConnsPerHost: 8,
-			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-				return dialer.DialContext(ctx, "tcp", addr)
-			},
-		}
+	if err := socks5Reply(c, socks5RepOK); err != nil {
+		up.Close()
+		return
 	}
-	return &proxy{cfg: cfg, pool: pool, dialer: dialer}
+	_ = c.SetDeadline(time.Time{})
+	pipe(c, up)
 }
 
-func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	switch {
-	case r.Method == http.MethodConnect:
-		p.handleCONNECT(w, r)
-	case r.URL.Path == "/_pool/stats" && r.URL.Host == "":
-		p.handleStats(w, r)
+func (s *server) dial(host, port string) (net.Conn, error) {
+	if net.ParseIP(host) != nil {
+		if s.hosts.matchIP {
+			return s.dialPool(port)
+		}
+		return s.dialer.Dial("tcp", net.JoinHostPort(host, port))
+	}
+	if s.hosts.match(host) {
+		return s.dialPool(port)
+	}
+	return s.dialer.Dial("tcp", net.JoinHostPort(host, port))
+}
+
+func (s *server) dialPool(port string) (net.Conn, error) {
+	nd := s.pool.next()
+	if nd == nil {
+		return nil, errors.New("empty pool")
+	}
+	c, err := s.dialer.Dial("tcp", net.JoinHostPort(nd.ip, port))
+	if err != nil {
+		s.pool.fail(nd)
+		return nil, err
+	}
+	s.pool.ok(nd)
+	return c, nil
+}
+
+const (
+	socks5Ver                = 0x05
+	socks5CmdConnect         = 0x01
+	socks5AtypIPv4           = 0x01
+	socks5AtypDomain         = 0x03
+	socks5AtypIPv6           = 0x04
+	socks5RepOK              = 0x00
+	socks5RepCommand         = 0x07
+	socks5RepAtyp            = 0x08
+	socks5RepHostUnreachable = 0x04
+)
+
+func socks5Handshake(c net.Conn) (host, port string, err error) {
+	var hdr [2]byte
+	if _, err = io.ReadFull(c, hdr[:]); err != nil {
+		return "", "", err
+	}
+	if hdr[0] != socks5Ver {
+		return "", "", errors.New("not socks5")
+	}
+	var methods [255]byte
+	if _, err = io.ReadFull(c, methods[:int(hdr[1])]); err != nil {
+		return "", "", err
+	}
+	ack := [2]byte{socks5Ver, 0x00}
+	if _, err = c.Write(ack[:]); err != nil {
+		return "", "", err
+	}
+
+	var req [4]byte
+	if _, err = io.ReadFull(c, req[:]); err != nil {
+		return "", "", err
+	}
+	if req[0] != socks5Ver {
+		return "", "", errors.New("bad ver")
+	}
+	if req[1] != socks5CmdConnect {
+		_ = socks5Reply(c, socks5RepCommand)
+		return "", "", errors.New("only CONNECT")
+	}
+
+	switch req[3] {
+	case socks5AtypIPv4:
+		var a [4]byte
+		if _, err = io.ReadFull(c, a[:]); err != nil {
+			return "", "", err
+		}
+		host = net.IP(a[:]).String()
+	case socks5AtypIPv6:
+		var a [16]byte
+		if _, err = io.ReadFull(c, a[:]); err != nil {
+			return "", "", err
+		}
+		host = net.IP(a[:]).String()
+	case socks5AtypDomain:
+		var lb [1]byte
+		if _, err = io.ReadFull(c, lb[:]); err != nil {
+			return "", "", err
+		}
+		var name [255]byte
+		n := int(lb[0])
+		if _, err = io.ReadFull(c, name[:n]); err != nil {
+			return "", "", err
+		}
+		for i := 0; i < n; i++ {
+			if name[i] >= 'A' && name[i] <= 'Z' {
+				name[i] += 'a' - 'A'
+			}
+		}
+		host = string(name[:n])
 	default:
-		p.handleHTTP(w, r)
+		_ = socks5Reply(c, socks5RepAtyp)
+		return "", "", errors.New("bad atyp")
 	}
+	var pb [2]byte
+	if _, err = io.ReadFull(c, pb[:]); err != nil {
+		return "", "", err
+	}
+	return host, strconv.Itoa(int(binary.BigEndian.Uint16(pb[:]))), nil
 }
 
-func (p *proxy) handleStats(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(statsResp{
-		CDNHost: p.cfg.CDNHost,
-		Listen:  p.cfg.Listen,
-		Total:   len(p.pool.nodes),
-		Nodes:   p.pool.stats(),
-	})
+func socks5Reply(c net.Conn, rep byte) error {
+	buf := [10]byte{socks5Ver, rep, 0, socks5AtypIPv4}
+	_, err := c.Write(buf[:])
+	return err
 }
 
-func (p *proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Host == "" && r.Host == "" {
-		http.Error(w, "not a proxy request (need absolute URL or Host)", http.StatusBadRequest)
-		return
-	}
-
-	nd := p.pool.next()
-	if nd == nil {
-		http.Error(w, "empty pool", http.StatusBadGateway)
-		return
-	}
-
-	u := *r.URL
-	u.Scheme = "https"
-	u.Host = p.cfg.CDNHost
-	outReq := &http.Request{
-		Method:        r.Method,
-		URL:           &u,
-		Proto:         r.Proto,
-		ProtoMajor:    r.ProtoMajor,
-		ProtoMinor:    r.ProtoMinor,
-		Header:        r.Header.Clone(),
-		Body:          r.Body,
-		ContentLength: r.ContentLength,
-		Host:          p.cfg.CDNHost,
-	}
-	if outReq.Header == nil {
-		outReq.Header = make(http.Header)
-	}
-	applyHeaders(outReq.Header, p.cfg.Headers)
-	stripHopHeaders(outReq.Header)
-	if outReq.Body == http.NoBody {
-		outReq.Body = nil
-	}
-
-	resp, err := nd.tr.RoundTrip(outReq.WithContext(r.Context()))
-	if err != nil {
-		p.pool.fail(nd)
-		log.Printf("http %s via %s: %v", r.URL.Path, nd.addr, err)
-		http.Error(w, "upstream: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-	p.pool.ok(nd)
-
-	copyHeader(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
-}
-
-func (p *proxy) handleCONNECT(w http.ResponseWriter, r *http.Request) {
-	nd := p.pool.next()
-	if nd == nil {
-		http.Error(w, "empty pool", http.StatusBadGateway)
-		return
-	}
-
-	up, err := p.dialer.DialContext(r.Context(), "tcp", nd.addr)
-	if err != nil {
-		p.pool.fail(nd)
-		http.Error(w, "dial: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-
-	hj, ok := w.(http.Hijacker)
-	if !ok {
-		up.Close()
-		http.Error(w, "hijack not supported", http.StatusInternalServerError)
-		return
-	}
-	client, bufrw, err := hj.Hijack()
-	if err != nil {
-		up.Close()
-		http.Error(w, "hijack: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	if _, err := io.WriteString(client, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
-		up.Close()
-		client.Close()
-		return
-	}
-	if err := bufrw.Flush(); err != nil {
-		up.Close()
-		client.Close()
-		return
-	}
-
-	p.pool.ok(nd)
-	// Transparent TCP tunnel. Client does its own TLS; extra headers only
-	// apply on the HTTP-proxy path.
-	left := struct {
-		io.Reader
-		io.Writer
-		io.Closer
-	}{io.MultiReader(bufrw.Reader, client), client, client}
-	pipe(left, up)
-}
-
-func applyHeaders(h http.Header, extra map[string]string) {
-	for k, v := range extra {
-		if v == "" {
-			h.Del(k)
-			continue
-		}
-		h.Set(k, v)
-	}
-}
-
-var hopHeaders = []string{
-	"Connection", "Proxy-Connection", "Keep-Alive",
-	"Proxy-Authenticate", "Proxy-Authorization",
-	"Te", "Trailer", "Transfer-Encoding", "Upgrade",
-}
-
-func stripHopHeaders(h http.Header) {
-	for _, k := range hopHeaders {
-		h.Del(k)
-	}
-}
-
-func copyHeader(dst, src http.Header) {
-	for k, vs := range src {
-		dst[k] = vs
-	}
-	stripHopHeaders(dst)
-}
-
-func pipe(a, b io.ReadWriteCloser) {
-	var once sync.Once
-	closeBoth := func() {
-		once.Do(func() {
-			a.Close()
-			b.Close()
-		})
-	}
-	cp := func(dst, src io.ReadWriteCloser) {
-		_, _ = io.Copy(dst, src)
-		if c, ok := dst.(interface{ CloseWrite() error }); ok {
-			_ = c.CloseWrite()
-		}
-		closeBoth()
-	}
-	go cp(a, b)
-	cp(b, a)
+func pipe(a, b net.Conn) {
+	defer a.Close()
+	defer b.Close()
+	go func() {
+		_, _ = io.Copy(a, b)
+		a.Close()
+	}()
+	_, _ = io.Copy(b, a)
 }

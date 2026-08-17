@@ -3,7 +3,7 @@ services:
     image: ghcr.io/myflv/cdn-pool:latest
     restart: unless-stopped
     ports:
-      - "18080:18080"
+      - "1080:1080"
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./ip.txt:/app/ip.txt:ro

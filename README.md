@@ -1,42 +1,44 @@
 # cdn-pool
 
-把请求通过 CDN 边缘 IP 池转发到 `cdn-host`。每次请求轮询一个 IP，连续失败超过 `max-fails` 次会冷却 `cooldown` 后再加回。
+SOCKS5h 代理：名单里的域名不走系统 DNS，改从 `ip.txt` 轮询一个边缘 IP 再拨号。
+客户端自己做 TLS、自己带 Header，代理只负责选 IP。
 
 ## 配置 `config.yaml`
 
 ```yaml
-listen: "0.0.0.0:18080"
-cdn-host: "cdn.example.com"
+listen: "0.0.0.0:1080"
 ip-file: "ip.txt"
+hosts:
+  - cdn.example.com
+  # - "*.example.com"
 max-fails: 3
 cooldown: 30s
 dial-timeout: 8s
-headers:
-  User-Agent: "Mozilla/5.0"
-  # Authorization: "Bearer xxx"
 ```
 
-`ip.txt` 一行一个 IP，支持 `1.2.3.4` 或 `1.2.3.4:443`，`#` 开头是注释。
+`ip.txt` 一行一个 IP（不要端口，端口用客户端要连的那个）。`#` 开头是注释。
+
+| 客户端要连 | 代理 |
+|---|---|
+| `hosts` 里的域名 | 轮询 `ip.txt`，拨 `选中IP:原端口` |
+| 其它域名 | 正常 DNS，直连 |
+| 字面 IP | 原样拨（除非 `hosts` 里写了 `*`） |
 
 ## 运行
 
 ```bash
-go run .                 # 或 go build -o cdn-pool && ./cdn-pool
-go run . -c /path/to/config.yaml
+go run . -c config.yaml
+# 或
+docker compose up -d
 ```
 
+必须用 **SOCKS5h**（域名在代理侧解析），否则客户端自己查 DNS，池子用不上：
+
 ```bash
-# HTTP 代理（绝对 URL，会注入 headers，Host/SNI 改成 cdn-host）
-curl -x http://127.0.0.1:18080 http://cdn.example.com/cdn-cgi/trace
+curl --socks5-hostname 127.0.0.1:1080 https://cdn.example.com/cdn-cgi/trace
 
-# HTTPS CONNECT（透明 TCP 隧道，客户端自己做 TLS）
-curl -x http://127.0.0.1:18080 https://cdn.example.com/cdn-cgi/trace
-
-# 反向代理
-curl http://127.0.0.1:18080/cdn-cgi/trace
-
-# 池状态
-curl http://127.0.0.1:18080/_pool/stats
+export ALL_PROXY=socks5h://127.0.0.1:1080
+curl https://cdn.example.com/cdn-cgi/trace
 ```
 
 ## Docker
@@ -45,12 +47,10 @@ curl http://127.0.0.1:18080/_pool/stats
 docker compose up -d
 ```
 
-`docker-compose.yml` 挂本地的 `config.yaml` 和 `ip.txt`。改完配置或 IP 列表后 `docker compose up -d` 会重启。
-
-也可以直接跑镜像：
+`docker-compose.yml` 挂本地的 `config.yaml` 和 `ip.txt`。
 
 ```bash
-docker run --rm -p 18080:18080 \
+docker run --rm -p 1080:1080 \
   -v $PWD/config.yaml:/app/config.yaml \
   -v $PWD/ip.txt:/app/ip.txt \
   ghcr.io/myflv/cdn-pool:latest
@@ -60,6 +60,6 @@ docker run --rm -p 18080:18080 \
 
 ## 行为
 
-- HTTP / 反向代理：出站连 `ip.txt` 里的 IP:443，TLS SNI 和 HTTP Host 强制改成 `cdn-host`，`headers` 覆盖到出站请求。
-- CONNECT：透明 TCP 隧道到选中的 IP，客户端自己做 TLS，改不了里面的 Header / SNI。
-- 某个 IP 连续失败 `max-fails` 次后踢出 `cooldown`，到期自动加回。
+- 只实现 SOCKS5 CONNECT，无认证。
+- 匹配 `hosts` 的域名：忽略真实 DNS，从 `ip.txt` 轮询，保留客户端端口。
+- 某个 IP 连续失败 `max-fails` 次后冷却 `cooldown`，到期自动加回。
