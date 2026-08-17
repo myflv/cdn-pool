@@ -1,0 +1,5 @@
+cdn-pool
+*.exe
+*.test
+.DS_Store
+dist/

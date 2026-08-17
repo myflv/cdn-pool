@@ -1,0 +1,11 @@
+listen: "0.0.0.0:18080"
+cdn-host: "cdn.example.com"
+ip-file: "ip.txt"
+max-fails: 3
+cooldown: 30s
+dial-timeout: 8s
+# 覆盖/追加到上游请求的 Header（只对 HTTP 代理路径生效，CONNECT 隧道改不了里面的 HTTPS）。
+# Host 会被强制改成 cdn-host。
+headers:
+  User-Agent: "Mozilla/5.0"
+  # Authorization: "Bearer xxx"
