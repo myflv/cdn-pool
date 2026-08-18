@@ -35,7 +35,7 @@ func main() {
 		log.Fatalf("load cidr file: %v", err)
 	}
 	if len(cidrs) == 0 {
-		log.Fatal("cidr.txt is empty")
+		log.Fatal("cidr file is empty")
 	}
 
 	log.Printf("cdn-pool %s socks5=%s hosts=%d cidrs=%d", version, cfg.Listen, len(cfg.Hosts), len(cidrs))
@@ -144,18 +144,17 @@ func loadCIDRs(path string) ([]string, error) {
 		if !strings.Contains(line, "/") {
 			line += "/24"
 		}
-		ip, _, err := net.ParseCIDR(line)
-		if err != nil {
+		_, ipnet, err := net.ParseCIDR(line)
+		if err != nil || ipnet.IP.To4() == nil {
 			log.Printf("skip invalid cidr: %s", line)
 			continue
 		}
-		n := ip.To4()
-		if n == nil {
+		ones, bits := ipnet.Mask.Size()
+		if bits != 32 || ones <= 0 {
 			log.Printf("skip invalid cidr: %s", line)
 			continue
 		}
-		n[3] = 0
-		key := n.String()
+		key := ipnet.String()
 		if _, ok := seen[key]; ok {
 			continue
 		}
@@ -484,18 +483,23 @@ func discoverIPs(server, name string, cidrs []string) ([]string, error) {
 	return out, nil
 }
 
-func lookupAWithECS(c *dns.Client, server, name, ecsIP string) ([]string, error) {
-	ip := net.ParseIP(ecsIP).To4()
+func lookupAWithECS(c *dns.Client, server, name, subnet string) ([]string, error) {
+	_, ipnet, err := net.ParseCIDR(subnet)
+	if err != nil {
+		return nil, err
+	}
+	ip := ipnet.IP.To4()
 	if ip == nil {
 		return nil, errors.New("bad ecs ip")
 	}
+	ones, _ := ipnet.Mask.Size()
 	m := new(dns.Msg)
 	m.SetQuestion(dns.Fqdn(name), dns.TypeA)
 	m.SetEdns0(1232, false)
 	m.IsEdns0().Option = append(m.IsEdns0().Option, &dns.EDNS0_SUBNET{
 		Code:          dns.EDNS0SUBNET,
 		Family:        1,
-		SourceNetmask: 24,
+		SourceNetmask: uint8(ones),
 		Address:       ip,
 	})
 
