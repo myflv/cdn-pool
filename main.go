@@ -34,13 +34,16 @@ func main() {
 	if err != nil {
 		log.Fatalf("load cidr file: %v", err)
 	}
-	if len(cidrs) == 0 {
-		log.Fatal("cidr file is empty")
+	static, err := loadIPs(resolvePath(*cfgPath, cfg.IPFile))
+	if err != nil {
+		log.Fatalf("load ip file: %v", err)
 	}
 
-	log.Printf("cdn-pool %s socks5=%s hosts=%d cidrs=%d", version, cfg.Listen, len(cfg.Hosts), len(cidrs))
-	log.Printf("cname=%s dns=%s", cfg.CNAME, cfg.DNS)
-	ips, err := discoverIPs(cfg.DNS, cfg.CNAME, cidrs)
+	log.Printf("cdn-pool %s socks5=%s hosts=%d cidrs=%d ips=%d", version, cfg.Listen, len(cfg.Hosts), len(cidrs), len(static))
+	if cfg.CNAME != "" {
+		log.Printf("cname=%s dns=%s", cfg.CNAME, cfg.DNS)
+	}
+	ips, err := resolvePool(cfg, cidrs, static)
 	if err != nil {
 		log.Fatalf("first refresh: %v", err)
 	}
@@ -49,8 +52,10 @@ func main() {
 		hosts:  newHostSet(cfg.Hosts),
 		dialer: &net.Dialer{Timeout: cfg.DialTimeout, KeepAlive: 30 * time.Second},
 	}
-	log.Printf("refresh: %d ips from %d cidrs", len(ips), len(cidrs))
-	go refreshLoop(cfg, cidrs, s.pool)
+	log.Printf("refresh: %d pool from %d cidrs %d ips", len(ips), len(cidrs), len(static))
+	if len(cidrs) > 0 {
+		go refreshLoop(cfg, cidrs, static, s.pool)
+	}
 
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
@@ -69,6 +74,7 @@ func main() {
 type config struct {
 	Listen      string        `yaml:"listen"`
 	CIDRFile    string        `yaml:"cidr-file"`
+	IPFile      string        `yaml:"ip-file"`
 	Hosts       []string      `yaml:"hosts"`
 	CNAME       string        `yaml:"cname"`
 	DNS         string        `yaml:"dns"`
@@ -90,9 +96,6 @@ func loadConfig(path string) (*config, error) {
 	if cfg.Listen == "" {
 		cfg.Listen = "0.0.0.0:1080"
 	}
-	if cfg.CIDRFile == "" {
-		cfg.CIDRFile = "cidr.txt"
-	}
 	if cfg.MaxFails <= 0 {
 		cfg.MaxFails = 3
 	}
@@ -113,55 +116,85 @@ func loadConfig(path string) (*config, error) {
 	if len(cfg.Hosts) == 0 {
 		return nil, errors.New("hosts is required (domains that use the IP pool)")
 	}
-	if cfg.CNAME == "" {
-		return nil, errors.New("cname is required")
-	}
 	return cfg, nil
 }
 
 func resolvePath(cfgPath, file string) string {
+	if file == "" {
+		return ""
+	}
 	if filepath.IsAbs(file) {
 		return file
 	}
 	return filepath.Join(filepath.Dir(cfgPath), file)
 }
 
-func loadCIDRs(path string) ([]string, error) {
+func loadLines(path string, parse func(string) (string, bool)) ([]string, error) {
+	if path == "" {
+		return nil, nil
+	}
 	f, err := os.Open(path)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
 		return nil, err
 	}
 	defer f.Close()
 
 	seen := map[string]struct{}{}
-	var cidrs []string
+	var out []string
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
+		key, ok := parse(line)
+		if !ok {
+			continue
+		}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, key)
+	}
+	return out, sc.Err()
+}
+
+func loadCIDRs(path string) ([]string, error) {
+	return loadLines(path, func(line string) (string, bool) {
 		if !strings.Contains(line, "/") {
 			line += "/24"
 		}
 		_, ipnet, err := net.ParseCIDR(line)
 		if err != nil || ipnet.IP.To4() == nil {
 			log.Printf("skip invalid cidr: %s", line)
-			continue
+			return "", false
 		}
 		ones, bits := ipnet.Mask.Size()
 		if bits != 32 || ones <= 0 {
 			log.Printf("skip invalid cidr: %s", line)
-			continue
+			return "", false
 		}
-		key := ipnet.String()
-		if _, ok := seen[key]; ok {
-			continue
+		return ipnet.String(), true
+	})
+}
+
+func loadIPs(path string) ([]string, error) {
+	return loadLines(path, func(line string) (string, bool) {
+		ip := net.ParseIP(strings.TrimSuffix(line, "/32")).To4()
+		if ip == nil {
+			if strings.Contains(line, "/") {
+				log.Printf("skip non-/32 in ip-file: %s", line)
+			} else {
+				log.Printf("skip invalid ip: %s", line)
+			}
+			return "", false
 		}
-		seen[key] = struct{}{}
-		cidrs = append(cidrs, key)
-	}
-	return cidrs, sc.Err()
+		return ip.String(), true
+	})
 }
 
 type suffixRule struct {
@@ -425,23 +458,58 @@ func pipe(a, b net.Conn) {
 	_, _ = io.Copy(b, a)
 }
 
-func refreshLoop(cfg *config, cidrs []string, p *pool) {
+func resolvePool(cfg *config, cidrs, static []string) ([]string, error) {
+	seen := map[string]struct{}{}
+	var out []string
+	add := func(ip string) {
+		if _, ok := seen[ip]; ok {
+			return
+		}
+		seen[ip] = struct{}{}
+		out = append(out, ip)
+	}
+	for _, ip := range static {
+		add(ip)
+	}
+	if len(cidrs) > 0 {
+		if cfg.CNAME == "" {
+			return nil, errors.New("cname is required when cidr-file is not empty")
+		}
+		ips, err := discoverIPs(cfg.DNS, cfg.CNAME, cidrs)
+		if err != nil {
+			if len(out) == 0 {
+				return nil, err
+			}
+			log.Printf("refresh cidrs: %v", err)
+		} else {
+			for _, ip := range ips {
+				add(ip)
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil, errors.New("empty pool: set ip-file and/or cidr-file + cname")
+	}
+	return out, nil
+}
+
+func refreshLoop(cfg *config, cidrs, static []string, p *pool) {
 	t := time.NewTicker(cfg.Refresh)
 	defer t.Stop()
 	for range t.C {
-		if err := refreshOnce(cfg, cidrs, p); err != nil {
+		if err := refreshOnce(cfg, cidrs, static, p); err != nil {
 			log.Printf("refresh: %v", err)
 		}
 	}
 }
 
-func refreshOnce(cfg *config, cidrs []string, p *pool) error {
-	ips, err := discoverIPs(cfg.DNS, cfg.CNAME, cidrs)
+func refreshOnce(cfg *config, cidrs, static []string, p *pool) error {
+	ips, err := resolvePool(cfg, cidrs, static)
 	if err != nil {
 		return err
 	}
 	p.replace(ips)
-	log.Printf("refresh: %d ips from %d cidrs", len(ips), len(cidrs))
+	log.Printf("refresh: %d pool from %d cidrs %d ips", len(ips), len(cidrs), len(static))
 	return nil
 }
 

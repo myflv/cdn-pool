@@ -7,3 +7,4 @@ services:
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./cidr.txt:/app/cidr.txt:ro
+      # - ./ip.txt:/app/ip.txt:ro
