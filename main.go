@@ -38,8 +38,8 @@ func main() {
 		log.Fatal("cidr.txt is empty")
 	}
 
-	log.Printf("cdn-pool %s socks5=%s hosts=%d cidrs=%d cname=%s via %s",
-		version, cfg.Listen, len(cfg.Hosts), len(cidrs), cfg.CNAME, cfg.DNS)
+	log.Printf("cdn-pool %s socks5=%s hosts=%d cidrs=%d", version, cfg.Listen, len(cfg.Hosts), len(cidrs))
+	log.Printf("cname=%s dns=%s", cfg.CNAME, cfg.DNS)
 	ips, err := discoverIPs(cfg.DNS, cfg.CNAME, cidrs)
 	if err != nil {
 		log.Fatalf("first refresh: %v", err)
